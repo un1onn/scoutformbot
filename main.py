@@ -12,7 +12,7 @@ from telegram.ext import (
 # Загрузка .env
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID"))
+ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(",")))
 
 # Константы состояний анкеты
 QUESTION1, QUESTION2, QUESTION3 = range(3)
@@ -71,7 +71,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        'Привет, это анкета для скаутов в агентство "хз".\n\nНажми "Начать", чтобы приступить:',
+        'Привет, это анкета для скаутов в агентство "Agency Scout".\n\nНажми "Начать", чтобы приступить:',
         reply_markup=reply_markup
     )
     logger.info(f"Пользователь {update.effective_user.id} использовал /start")
@@ -88,16 +88,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if query.data == "start_survey":
         user_id = user.id
-        now = datetime.now()
-
-        submitted_users = context.application.bot_data.get("submitted_users", {})
-        last_time = submitted_users.get(user_id)
-
-        if last_time and (now - last_time) < timedelta(hours=12):
-            await query.message.reply_text("Вы уже проходили анкету. Повторная попытка будет доступна через 12 часов.")
-            logger.info(f"Пользователь {user_id} попытался пройти анкету повторно слишком рано")
-            return ConversationHandler.END
-
         context.user_data.clear()
         await query.message.reply_text("Твой возраст?")
         logger.info(f"{user_id} начал заполнять анкету")
@@ -142,7 +132,7 @@ async def question3(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     answers = context.user_data
     result_text = (
-        f"\U0001F4E9 Новая анкета от @{user.username or 'неизвестно'} (ID: {user.id}):\n\n" +
+        f"📩 Новая анкета от @{user.username or 'неизвестно'} (ID: {user.id}):\n\n" +
         "\n".join(f"{k}: {v}" for k, v in answers.items())
     )
 
@@ -152,8 +142,16 @@ async def question3(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     ]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await context.bot.send_message(chat_id=ADMIN_ID, text=result_text, reply_markup=reply_markup)
-    logger.info(f"Анкета пользователя {user.id} отправлена админу")
+    context.application.bot_data.setdefault("pending_messages", {})[user.id] = []
+
+    for admin_id in ADMIN_IDS:
+        try:
+            msg = await context.bot.send_message(chat_id=admin_id, text=result_text, reply_markup=reply_markup)
+            context.application.bot_data["pending_messages"][user.id].append(msg.message_id)
+        except Exception as e:
+            logger.warning(f"Ошибка при отправке админу {admin_id}: {e}")
+
+    logger.info(f"Анкета пользователя {user.id} отправлена админам")
     return ConversationHandler.END
 
 
@@ -163,8 +161,16 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     data = query.data
     logger.info(f"Админ нажал кнопку: {data}")
 
+    admin_username = f"@{query.from_user.username}" if query.from_user.username else f"ID {query.from_user.id}"
+
     if data.startswith("accept_"):
         user_id = int(data.split("_")[1])
+
+        if user_id in context.application.bot_data.get("accepted_users", {}):
+            await query.edit_message_reply_markup(reply_markup=None)
+            await query.edit_message_text(query.message.text + f"\n\n⚠️ Анкета уже была принята ранее.")
+            return
+
         accepted_users = context.application.bot_data.get("accepted_users", {})
         accepted_users[user_id] = datetime.now()
         context.application.bot_data["accepted_users"] = accepted_users
@@ -176,13 +182,39 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             logger.warning(f"Ошибка при отправке пользователю {user_id}: {e}")
 
         await query.edit_message_reply_markup(reply_markup=None)
-        await query.edit_message_text(query.message.text + "\n\n✅ Анкета принята")
+        await query.edit_message_text(query.message.text + f"\n\n✅ Анкета пользователя ID {user_id} принята администратором {admin_username}")
         logger.info(f"Анкета пользователя {user_id} принята")
 
+        msg_ids = context.application.bot_data.get("pending_messages", {}).get(user_id, [])
+        for admin_id in ADMIN_IDS:
+            for msg_id in msg_ids:
+                if admin_id != query.from_user.id:
+                    try:
+                        await context.bot.edit_message_reply_markup(chat_id=admin_id, message_id=msg_id, reply_markup=None)
+                        await context.bot.send_message(chat_id=admin_id, text=f"✅ Анкета пользователя ID {user_id} принята администратором {admin_username}")
+                    except Exception as e:
+                        logger.warning(f"Ошибка при обновлении сообщения у админа {admin_id}: {e}")
+
     elif data.startswith("decline_"):
+        user_id = int(data.split("_")[1])
         await query.edit_message_reply_markup(reply_markup=None)
-        await query.edit_message_text(query.message.text + "\n\n❌ Анкета отклонена")
-        logger.info(f"Анкета пользователя отклонена")
+        await query.edit_message_text(query.message.text + f"\n\n❌ Анкета пользователя ID {user_id} отменена администратором {admin_username}")
+        logger.info(f"Анкета пользователя {user_id} отклонена")
+
+        try:
+            await context.bot.send_message(chat_id=user_id, text="К сожалению, ваша анкета была отклонена.")
+        except Exception as e:
+            logger.warning(f"Ошибка при отправке уведомления об отклонении пользователю {user_id}: {e}")
+
+        msg_ids = context.application.bot_data.get("pending_messages", {}).get(user_id, [])
+        for admin_id in ADMIN_IDS:
+            for msg_id in msg_ids:
+                if admin_id != query.from_user.id:
+                    try:
+                        await context.bot.edit_message_reply_markup(chat_id=admin_id, message_id=msg_id, reply_markup=None)
+                        await context.bot.send_message(chat_id=admin_id, text=f"❌ Анкета пользователя ID {user_id} отменена администратором {admin_username}")
+                    except Exception as e:
+                        logger.warning(f"Ошибка при обновлении сообщения у админа {admin_id}: {e}")
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -192,8 +224,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("Команда доступна только администратору.")
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("Команда доступна только администраторам.")
         return
 
     accepted_users = context.application.bot_data.get("accepted_users", {})
